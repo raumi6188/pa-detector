@@ -1,0 +1,12 @@
+# DBはActionsのキャッシュで持ち回る（100MB制限のためgit管理しない）
+data/
+*.db
+*.db-journal
+
+out/
+__pycache__/
+*.pyc
+
+# ローカルの設定（認証情報が入るため）
+run_pa_eod.bat
+run_pa.bat

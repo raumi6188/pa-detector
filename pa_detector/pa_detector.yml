@@ -1,0 +1,135 @@
+name: プライスアクション検知（日次）
+
+# 17:00 JST = 08:00 UTC
+# GitHub のスケジュール実行は混雑時に数十分遅れることがある。
+# 確実に大引け後（J-Quantsの更新は16:30頃）に走らせたいので、
+# 少し余裕を持たせて 08:15 UTC = 17:15 JST に設定している。
+on:
+  schedule:
+    - cron: "15 8 * * 1-5"
+  workflow_dispatch:          # 手動実行（テスト用）
+    inputs:
+      dry_run:
+        description: "メールを送らずHTMLだけ生成する"
+        type: boolean
+        default: false
+
+# results/ に結果CSVをコミットするため書き込み権限が要る
+permissions:
+  contents: write
+
+concurrency:
+  group: pa-detector
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      TZ: Asia/Tokyo
+      PA_DB_PATH: ${{ github.workspace }}/data/stock_data.db
+      PA_OUT_DIR: ${{ github.workspace }}/out
+      JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+      PA_SMTP_HOST: smtp.gmail.com
+      PA_SMTP_PORT: "587"
+      PA_SMTP_USER: ${{ secrets.PA_SMTP_USER }}
+      PA_SMTP_PASSWORD: ${{ secrets.PA_SMTP_PASSWORD }}
+      PA_MAIL_FROM: ${{ secrets.PA_SMTP_USER }}
+      PA_MAIL_TO: ${{ secrets.PA_MAIL_TO }}
+      # --- 絞り込み（ローカルの run_pa_eod.bat と揃えること）---
+      PA_MIN_TURNOVER: "50000000"
+      PA_CONF_B: "0.5"
+      PA_EXCLUDE: "14"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 依存パッケージ
+        run: pip install -r requirements.txt
+
+      # DBは約100MBあり git には置けない（1ファイル100MB上限）。
+      # Actions のキャッシュに載せ、日々差分更新して持ち回る。
+      # restore-keys でプレフィックス一致の最新キャッシュを拾うため、
+      # 日付キーが変わっても前日のDBが復元される。
+      - name: DBキャッシュを復元
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: stockdb-${{ github.run_id }}
+          restore-keys: stockdb-
+
+      # キャッシュの output に依存せず、DBファイルの実在で分岐する。
+      # 初回・キャッシュ失効・破損のいずれでも正しくフルビルドに落ちる。
+      - name: DBを更新
+        run: |
+          mkdir -p data
+          if [ -s "$PA_DB_PATH" ]; then
+            echo "既存DBを差分更新します"
+            STMT_DAYS=7
+            FROM_ARG=""
+          else
+            echo "DBが無いためフルビルドします（10分程度）"
+            STMT_DAYS=400
+            FROM_ARG="--from $(date -d '400 days ago' +%Y-%m-%d)"
+          fi
+          python -m pa_detector.update_db --refresh-listed
+          python -m pa_detector.update_db --quotes $FROM_ARG
+          python -m pa_detector.update_db --statements --stmt-days $STMT_DAYS
+
+      - name: DBの状態
+        run: python -m pa_detector.store --health || true
+
+      - name: 検知して送信
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python -m pa_detector.run_intraday --eod --dry-run --skip-if-not-today
+          else
+            python -m pa_detector.run_intraday --eod --skip-if-not-today
+          fi
+
+      # 検証用のデータ。CSVは1日あたり数十KBなので git に置いて構わない。
+      # 第9章の尤度比推定はこれを積み上げて行う。
+      - name: 結果をリポジトリに記録
+        run: |
+          mkdir -p results
+          if ls out/*.csv >/dev/null 2>&1; then
+            cp out/*.csv results/
+            git config user.name  "pa-detector"
+            git config user.email "actions@github.com"
+            git add results
+            if ! git diff --cached --quiet; then
+              git commit -m "検知結果 $(date +%Y-%m-%d)"
+              git pull --rebase --autostash || true
+              git push
+            else
+              echo "新しい結果なし"
+            fi
+          else
+            echo "CSVなし（休場日）"
+          fi
+
+      - name: HTMLを成果物として保存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ github.run_number }}
+          path: out/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      # キャッシュは同じキーで上書きできないため、毎回 run_id でキーを作る。
+      # 上の restore-keys が prefix 一致で最新を拾う。
+      - name: DBキャッシュを保存
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: stockdb-${{ github.run_id }}
