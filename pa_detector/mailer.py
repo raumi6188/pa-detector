@@ -3,6 +3,9 @@
 from __future__ import annotations
 import smtplib
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+import os
 from email.header import Header
 from email.utils import formatdate
 
@@ -102,10 +105,20 @@ def build_html(rows, as_of: str, snapshot_time: str, stats: dict,
     return "".join(parts)
 
 
-def send(html: str, subject: str, cfg):
+def send(html: str, subject: str, cfg, attach_path: str | None = None):
+    """attach_path を渡すと note 用の原稿を添付する（スマホからも貼れる）。"""
     if not (cfg.smtp_user and cfg.smtp_password and cfg.mail_to):
         raise RuntimeError("SMTP設定が未入力です（PA_SMTP_USER / PA_SMTP_PASSWORD / PA_MAIL_TO）")
-    msg = MIMEText(html, "html", "utf-8")
+    if attach_path and os.path.exists(attach_path):
+        msg = MIMEMultipart()
+        msg.attach(MIMEText(html, "html", "utf-8"))
+        with open(attach_path, "rb") as f:
+            part = MIMEApplication(f.read(), _subtype="markdown")
+        part.add_header("Content-Disposition", "attachment",
+                        filename=os.path.basename(attach_path))
+        msg.attach(part)
+    else:
+        msg = MIMEText(html, "html", "utf-8")
     msg["Subject"] = Header(subject, "utf-8")
     msg["From"] = cfg.mail_from or cfg.smtp_user
     msg["To"] = cfg.mail_to
